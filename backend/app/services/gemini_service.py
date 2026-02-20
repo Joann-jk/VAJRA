@@ -5,101 +5,105 @@ with the requested fields. The output is parsed with a conservative parser to
 avoid crashes if Gemini includes extra text.
 """
 import logging
-from typing import Any, Dict
+from typing import Dict, Any
 from starlette.concurrency import run_in_threadpool
+import base64
 
 from app.config.settings import settings
-from app.utils.parser import safe_parse_json
 
 logger = logging.getLogger(__name__)
 
 
-async def analyze_text(conversation: str) -> Dict[str, Any]:
-    """Send conversation to Gemini model and return parsed JSON with insights.
+async def summarize_text(conversation: str) -> Any:
+    """Summarize a text conversation using Gemini.
 
-    Returns a dict with keys: summary, detected_languages, sentiment, primary_intents, topics_entities
-    On failure returns reasonable defaults.
+    Returns either a string (summary) or a dict like {"error": "..."} on fatal errors.
     """
-    if not conversation:
-        return {
-            "summary": "",
-            "detected_languages": [],
-            "sentiment": "Neutral",
-            "primary_intents": [],
-            "topics_entities": [],
-        }
-
     api_key = settings.GEMINI_API_KEY
     if not api_key:
-        logger.warning("GEMINI_API_KEY not configured; returning mock analysis")
-        # Return a small mock response so the backend remains usable without a key
-        return {
-            "summary": (conversation[:300] + "...") if len(conversation) > 300 else conversation,
-            "detected_languages": ["en"],
-            "sentiment": "Neutral",
-            "primary_intents": [],
-            "topics_entities": [],
-        }
+        return {"error": "Gemini API key not configured"}
 
-    # Build the prompt instructing Gemini to output only JSON
     prompt = (
-        "You are a conversation analysis engine. Return ONLY a valid JSON object with the following keys:"
-        " summary, detected_languages (list), sentiment (Positive/Neutral/Negative), primary_intents (list),"
-        " topics_entities (list). Do not include any explanation or extra text. Analyze the following conversation:\n\n"
+        "You are a concise summarization engine. Return ONLY a short summary (1-2 sentences) of the following text.\n\n"
         + conversation
     )
 
     try:
-        # Use google-generativeai SDK. The call below runs in a threadpool because the
-        # SDK client is synchronous.
         import google.generativeai as genai
 
         genai.configure(api_key=api_key)
 
         def call_model():
-            # generate_text or generate may differ depending on SDK version; modern versions
-            # expose `generate_text` which returns an object with `text` or `content`.
+            # Prefer generate_text if available
             try:
                 resp = genai.generate_text(model="gemini-1.5-flash", input=prompt)
-                # Try to extract text safely from response
-                if hasattr(resp, "text"):
+                # Many SDK versions use `.text` or `.content`
+                if hasattr(resp, "text") and resp.text:
                     return resp.text
-                if hasattr(resp, "content"):
+                if hasattr(resp, "content") and resp.content:
                     return resp.content
-                # fallback to string representation
                 return str(resp)
-            except Exception as e:
-                # Some SDKs provide `chat` or `generate` APIs; try `chat` as fallback
-                try:
-                    resp = genai.chat.create(model="gemini-1.5-flash", messages=[{"role": "user", "content": prompt}])
-                    # depending on sdk, messages may be nested
-                    if isinstance(resp, dict):
-                        # try common paths
-                        return resp.get("content") or resp.get("text") or str(resp)
-                    return str(resp)
-                except Exception:
-                    raise e
+            except Exception:
+                # Fallback to chat.create if present
+                resp = genai.chat.create(model="gemini-1.5-flash", messages=[{"role": "user", "content": prompt}])
+                # Attempt to find text in response
+                if hasattr(resp, "candidates") and resp.candidates:
+                    return getattr(resp.candidates[0], "content", str(resp))
+                return str(resp)
 
         raw = await run_in_threadpool(call_model)
-
-        # Parse the JSON portion of the model output
-        parsed = safe_parse_json(raw)
-
-        # Ensure keys exist with safe defaults
-        return {
-            "summary": parsed.get("summary", "") if isinstance(parsed, dict) else "",
-            "detected_languages": parsed.get("detected_languages", []) if isinstance(parsed, dict) else [],
-            "sentiment": parsed.get("sentiment", "Neutral") if isinstance(parsed, dict) else "Neutral",
-            "primary_intents": parsed.get("primary_intents", []) if isinstance(parsed, dict) else [],
-            "topics_entities": parsed.get("topics_entities", []) if isinstance(parsed, dict) else [],
-        }
+        # Raw may contain extra whitespace; return a cleaned string
+        summary = raw.strip() if isinstance(raw, str) else str(raw)
+        return summary
     except Exception as exc:
-        logger.exception("Failed to call Gemini: %s", exc)
-        # Return fallback minimal structure on error
-        return {
-            "summary": (conversation[:300] + "...") if len(conversation) > 300 else conversation,
-            "detected_languages": [],
-            "sentiment": "Neutral",
-            "primary_intents": [],
-            "topics_entities": [],
-        }
+        logger.exception("Gemini text summarization failed: %s", exc)
+        return {"error": f"Gemini text summarization failed: {exc}"}
+
+
+async def summarize_audio(audio_bytes: bytes) -> Any:
+    """Summarize audio by sending it to a multimodal Gemini model.
+
+    This implementation base64-encodes the audio and includes it in the prompt so
+    it remains compatible with SDKs that don't expose a dedicated audio input.
+    If the SDK being used supports direct binary/multimodal attachments, this
+    can be adapted to use that API.
+    """
+    api_key = settings.GEMINI_API_KEY
+    if not api_key:
+        return {"error": "Gemini API key not configured"}
+
+    try:
+        b64 = base64.b64encode(audio_bytes).decode("ascii")
+        prompt = (
+            "You are a multimodal assistant. A client uploaded an audio file encoded in base64. "
+            "Provide ONLY a short summary (1-2 sentences) of the audio content. Do not include any extra text.\n"
+            "Base64 audio:\n" + b64
+        )
+
+        import google.generativeai as genai
+
+        genai.configure(api_key=api_key)
+
+        def call_model():
+            # Try generate_text (may accept long text) as fallback for base64 approach
+            try:
+                resp = genai.generate_text(model="gemini-1.5-flash", input=prompt)
+                if hasattr(resp, "text") and resp.text:
+                    return resp.text
+                if hasattr(resp, "content") and resp.content:
+                    return resp.content
+                return str(resp)
+            except Exception:
+                # fallback to chat
+                resp = genai.chat.create(model="gemini-1.5-flash", messages=[{"role": "user", "content": prompt}])
+                if hasattr(resp, "candidates") and resp.candidates:
+                    return getattr(resp.candidates[0], "content", str(resp))
+                return str(resp)
+
+        raw = await run_in_threadpool(call_model)
+        summary = raw.strip() if isinstance(raw, str) else str(raw)
+        return summary
+    except Exception as exc:
+        logger.exception("Gemini audio summarization failed: %s", exc)
+        return {"error": f"Gemini audio summarization failed: {exc}"}
+
