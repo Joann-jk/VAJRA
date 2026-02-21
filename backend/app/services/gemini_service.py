@@ -6,6 +6,7 @@ async FastAPI loop is not blocked.
 """
 import logging
 import os
+import tempfile
 from typing import Any
 from starlette.concurrency import run_in_threadpool
 
@@ -18,13 +19,14 @@ async def summarize_text(conversation: str) -> Any:
     Returns a short summary string on success, or a dict {"detail": "..."}
     on failure. Does not raise exceptions.
     """
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     # Fallback to settings if present (backwards compatibility)
     if not api_key:
         try:
             from app.config.settings import settings
 
-            api_key = settings.GEMINI_API_KEY
+            # Allow using GEMINI_API_KEY as a fallback if GROQ_API_KEY not set
+            api_key = os.getenv("GROQ_API_KEY") or getattr(settings, "GEMINI_API_KEY", None)
         except Exception:
             api_key = None
 
@@ -37,24 +39,36 @@ async def summarize_text(conversation: str) -> Any:
     )
 
     try:
-        import google.generativeai as genai
+        # Use Groq API for chat completions
+        from groq import Groq
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        client = Groq(api_key=api_key)
 
         def call_model():
-            resp = model.generate_content(prompt)
-            # New SDK responses expose `.text` for the generated content
-            if hasattr(resp, "text") and resp.text:
-                return resp.text
-            return str(resp)
+            print("Calling Groq model...")
+            # Build chat completion request per Groq API
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "user", "content": f"Summarize this conversation:\n{conversation}"}
+                ],
+            )
+
+            try:
+                return response.choices[0].message.content
+            except Exception:
+                # Fallback to stringified response for debugging
+                try:
+                    return str(response)
+                except Exception:
+                    return ""
 
         raw = await run_in_threadpool(call_model)
         summary = raw.strip() if isinstance(raw, str) else str(raw)
         return summary
     except Exception:
         logger.exception("Gemini text summarization failed")
-        return {"detail": "Gemini text summarization failed"}
+        return {"detail": "Groq text summarization failed"}
 
 
 async def summarize_audio(audio_bytes: bytes) -> Any:
@@ -63,12 +77,12 @@ async def summarize_audio(audio_bytes: bytes) -> Any:
     Sends an instruction plus the binary audio as a multimodal input and
     returns a short summary string or an error dict with `detail` on failure.
     """
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         try:
             from app.config.settings import settings
 
-            api_key = settings.GEMINI_API_KEY
+            api_key = os.getenv("GROQ_API_KEY") or getattr(settings, "GEMINI_API_KEY", None)
         except Exception:
             api_key = None
 
@@ -76,24 +90,40 @@ async def summarize_audio(audio_bytes: bytes) -> Any:
         return {"detail": "Gemini API key not configured"}
 
     try:
-        import google.generativeai as genai
+        # Transcribe audio first. Check for existing transcription support.
+        transcribed_text = None
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        # Attempt to use speech_recognition if available as a simple local fallback
+        try:
+            import speech_recognition as sr
 
-        def call_model():
-            resp = model.generate_content([
-                "Summarize this audio conversation in 1-2 short sentences.",
-                {"mime_type": "audio/mp3", "data": audio_bytes},
-            ])
-            if hasattr(resp, "text") and resp.text:
-                return resp.text
-            return str(resp)
+            recognizer = sr.Recognizer()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmpf:
+                tmpf.write(audio_bytes)
+                tmpf.flush()
+                tmp_path = tmpf.name
 
-        raw = await run_in_threadpool(call_model)
-        summary = raw.strip() if isinstance(raw, str) else str(raw)
-        return summary
+            try:
+                with sr.AudioFile(tmp_path) as source:
+                    audio = recognizer.record(source)
+                    transcribed_text = recognizer.recognize_google(audio)
+            except Exception:
+                transcribed_text = None
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+        except Exception:
+            transcribed_text = None
+
+        if not transcribed_text:
+            # If no transcription available, return informative error
+            return {"detail": "Transcription not available. Configure a transcription provider."}
+
+        # Reuse summarize_text to send the transcribed conversation to Groq
+        return await summarize_text(transcribed_text)
     except Exception:
-        logger.exception("Gemini audio summarization failed")
-        return {"detail": "Gemini audio summarization failed"}
+        logger.exception("Audio summarization via Groq failed")
+        return {"detail": "Groq audio summarization failed"}
 
